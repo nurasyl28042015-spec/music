@@ -1,0 +1,131 @@
+import os
+import asyncio
+import logging
+import shutil
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from yt_dlp import YoutubeDL
+from shazamio import Shazam
+
+# --- КОНФИГУРАЦИЯ ---
+TOKEN = "8601490571:AAFpVbjvQbtRY-pSgYlPAMfosA9lW90pF74"
+DOWNLOAD_PATH = "bot_downloads"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+shazam = Shazam()
+
+def clear_download_folder():
+    if os.path.exists(DOWNLOAD_PATH):
+        shutil.rmtree(DOWNLOAD_PATH)
+    os.makedirs(DOWNLOAD_PATH)
+
+async def download_media(url: str, mode='video'):
+    # Генерируем уникальное имя, чтобы избежать ошибок доступа
+    unique_id = str(asyncio.get_event_loop().time()).replace('.', '')
+    filename = f"{DOWNLOAD_PATH}/{mode}_{unique_id}.%(ext)s"
+    
+    ydl_opts = {
+        'outtmpl': filename,
+        'quiet': True,
+        'noplaylist': True,
+        'nocheckcertificate': True,
+        'ignoreerrors': True,
+    }
+
+    if mode == 'video':
+        # Поддержка TikTok/Reels без водяных знаков
+        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+        ydl_opts['merge_output_format'] = 'mp4'
+    else:
+        # Поиск аудио
+        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['default_search'] = 'ytsearch'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+
+    with YoutubeDL(ydl_opts) as ydl:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+        
+        if info is None:
+            raise Exception("Не удалось скачать медиа")
+            
+        if 'entries' in info:
+            info = info['entries'][0]
+        
+        path = ydl.prepare_filename(info)
+        if mode == 'audio':
+            return path.rsplit('.', 1)[0] + ".mp3"
+        return path
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Кидай сыллку даун")
+
+# ГИБКИЙ ФИЛЬТР: Сработает на любую ссылку из перечисленных сервисов
+@dp.message(lambda msg: msg.text and any(x in msg.text.lower() for x in ['tiktok.com', 'instagram.com', 'youtube.com/shorts', 'youtu.be']))
+async def handle_link(message: types.Message):
+    logging.info(f"Получена ссылка: {message.text}")
+    status_msg = await message.answer("...")
+    files_to_delete = []
+
+    try:
+        # 1. Скачиваем видео
+        await status_msg.edit_text("...")
+        video_path = await download_media(message.text, mode='video')
+        if not video_path or not os.path.exists(video_path):
+            raise Exception("хз не нашел")
+        files_to_delete.append(video_path)
+
+        # 2. Распознаем музыку
+        await status_msg.edit_text("...")
+        out = await shazam.recognize_song(video_path)
+        
+        if out and out.get('track'):
+            track_info = out['track']
+            track_title = f"{track_info['subtitle']} - {track_info['title']}"
+            await status_msg.edit_text(f"✅ Найдено: {track_title}\nИщу полную версию MP3...")
+            
+            # 3. Скачиваем MP3
+            audio_path = await download_media(track_title, mode='audio')
+            files_to_delete.append(audio_path)
+            
+            # 4. Отправляем всё
+            await message.answer_video(types.FSInputFile(video_path), caption=" Видео скачано")
+            await message.answer_audio(
+                types.FSInputFile(audio_path),
+                performer=track_info.get('subtitle', 'Unknown'),
+                title=track_info.get('title', 'Unknown')
+            )
+        else:
+            await status_msg.edit_text("Музыка не распознана, отправляю только видео.")
+            await message.answer_video(types.FSInputFile(video_path))
+
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)[:50]}...")
+    
+    finally:
+        try:
+            await status_msg.delete()
+        except:
+            pass
+            
+        for path in files_to_delete:
+            if path and os.path.exists(path):
+                os.remove(path)
+                logging.info(f"🗑 Удален: {path}")
+
+async def main():
+    clear_download_folder()
+    logging.info("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
